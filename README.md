@@ -101,6 +101,92 @@ LOCAL_N_GPU_LAYERS=35
 PYTHONPATH=. uv run pytest tests/ --ignore=tests/test_e2e.py -v
 ```
 
+## Multi-Agent Workflow with LangGraph
+
+```text
+User query (Streamlit)
+        │
+        ▼
+┌───────────────────────────────────────────────────────────┐
+│  Node 1 — extractor                                       │
+│                                                           │
+│  asyncio.gather(                                          │
+│    LLM call → intent + filters (JSON),                    │
+│    Polars speculative prefetch (7 common aggregations)    │
+│  )                                                        │
+│                                                           │
+│  Intents: pl_summary | comparison | ledger_query |        │
+│           tenant_analysis | general                       │
+│  Filters: property_name, tenant_name, year, quarter,      │
+│           ledger_category, ledger_group                   │
+└───────────────────┬───────────────────────────────────────┘
+                    │ AgentState: intent + filters + prefetch
+                    ▼
+┌───────────────────────────────────────────────────────────┐
+│  Node 2 — retrieval                                       │
+│                                                           │
+│  Tier 1: TTLCache(maxsize=256, ttl=300s) hit  →  <5 ms   │
+│  Tier 2: Speculative prefetch hit             →  ~0 ms   │
+│  Tier 3: Fresh Polars deterministic query     →  ~10 ms  │
+│                                                           │
+│  Fuzzy matching on property/tenant/ledger names           │
+└───────────────────┬───────────────────────────────────────┘
+                    │ AgentState: raw_results
+                    ▼
+┌───────────────────────────────────────────────────────────┐
+│  Node 3 — reason_and_synthesize                           │
+│                                                           │
+│  asyncio.create_task(                                     │
+│    Critic + Judge (Python, <1 ms) — validates data,       │
+│    Synthesizer LLM — generates NL response                │
+│  )                                                        │
+│                                                           │
+│  If Judge = CLARIFY → return clarification message        │
+│  If Judge = OK      → return synthesizer response         │
+└───────────────────────────────────────────────────────────┘
+                    │
+                    ▼
+          final_response → Streamlit UI
+```
+
+**Graph edges:**
+
+- `extractor` → `retrieval` (always)
+- `retrieval` → `reason_and_synthesize` (always)
+- `reason_and_synthesize` → `END` (always — clarification or answer)
+
+**State** (`AgentState`): `user_query`, `intent`, `filters`, `prefetch_results`, `raw_results`, `critique`, `needs_clarification`, `final_response`, `cache_hit`, `iterations`, `timings`
+
+---
+
+## Challenges
+
+### LLM Output vs Data Schema Mismatch
+
+The LLM outputs human-readable values (e.g. `"Bank charges"`) but the parquet stores snake_case (`bank_charges`). Fixed by normalising filter values in `resolve_filters()` before querying, passing exact known values in the extractor system prompt, and adding a fuzzy fallback in `_apply_filters()`.
+
+### Streamlit + asyncio Conflict
+
+Streamlit runs its own event loop. `asyncio.run()` inside a Streamlit script raises `RuntimeError: This event loop is already running`. Fixed by scoping `asyncio.run()` only to the LangGraph `ainvoke` call and moving LLM pre-warm to a background daemon thread.
+
+### Slow App Startup (60+ seconds)
+
+`asyncio.run(prewarm_llm())` at module level blocked the entire UI while the GGUF model loaded. Fixed by moving pre-warm to `threading.Thread(daemon=True)` — UI is immediately responsive.
+
+### Graph Recompilation on Every Rerun
+
+`StateGraph` compilation with a Pydantic schema is expensive. `st.session_state` still re-ran it on each Streamlit rerun. Fixed with `@st.cache_resource` — compiled once per server process.
+
+### Fuzzy Matching False Positives
+
+Default `difflib` cutoff of 0.6 matched `"Building 999"` → `"Building 17"`. Raised cutoff to 0.80 for property and tenant resolution.
+
+### Pydantic v2 Deprecation
+
+`class Config` inside `BaseModel` is deprecated in Pydantic v2. Replaced with `model_config = ConfigDict(arbitrary_types_allowed=True)`.
+
+---
+
 ## Data
 
 `cortex.parquet` — 3,924 rows · 5 properties (Building 17/120/140/160/180) · 2024-Q1 to 2025-Q1 · columns: `entity_name`, `property_name`, `tenant_name`, `ledger_type`, `ledger_group`, `ledger_category`, `ledger_code`, `ledger_description`, `month`, `quarter`, `year`, `profit`.
