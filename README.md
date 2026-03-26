@@ -107,47 +107,46 @@ PYTHONPATH=. uv run pytest tests/ --ignore=tests/test_e2e.py -v
 User query (Streamlit)
         │
         ▼
-┌───────────────────────────────────────────────────────────┐
-│  Node 1 — extractor                                       │
-│                                                           │
-│  asyncio.gather(                                          │
-│    LLM call → intent + filters (JSON),                    │
-│    Polars speculative prefetch (7 common aggregations)    │
-│  )                                                        │
-│                                                           │
-│  Intents: pl_summary | comparison | ledger_query |        │
-│           tenant_analysis | general                       │
-│  Filters: property_name, tenant_name, year, quarter,      │
-│           ledger_category, ledger_group                   │
-└───────────────────┬───────────────────────────────────────┘
-                    │ AgentState: intent + filters + prefetch
-                    ▼
-┌───────────────────────────────────────────────────────────┐
-│  Node 2 — retrieval                                       │
-│                                                           │
-│  Tier 1: TTLCache(maxsize=256, ttl=300s) hit  →  <5 ms   │
-│  Tier 2: Speculative prefetch hit             →  ~0 ms   │
-│  Tier 3: Fresh Polars deterministic query     →  ~10 ms  │
-│                                                           │
-│  Fuzzy matching on property/tenant/ledger names           │
-└───────────────────┬───────────────────────────────────────┘
-                    │ AgentState: raw_results
-                    ▼
-┌───────────────────────────────────────────────────────────┐
-│  Node 3 — reason_and_synthesize                           │
-│                                                           │
-│  asyncio.create_task(                                     │
-│    Critic + Judge (Python, <1 ms) — validates data,       │
-│    Synthesizer LLM — generates NL response                │
-│  )                                                        │
-│                                                           │
-│  If Judge = CLARIFY → return clarification message        │
-│  If Judge = OK      → return synthesizer response         │
-└───────────────────────────────────────────────────────────┘
-                    │
-                    ▼
-          final_response → Streamlit UI
+╔═══════════════════════════════════════════════════════════╗
+║  Node 1 — extractor          [PARALLEL inside node]      ║
+║                                                           ║
+║   ┌─────────────────────┐   ┌───────────────────────────┐ ║
+║   │  LLM call           │   │  Speculative Polars       │ ║
+║   │  intent + filters   │   │  prefetch (7 aggregations)│ ║
+║   │  → JSON schema      │   │  while LLM is running     │ ║
+║   └──────────┬──────────┘   └─────────────┬─────────────┘ ║
+║              └──────── asyncio.gather ─────┘              ║
+╚═══════════════════════════╤═══════════════════════════════╝
+                            │ intent + filters + prefetch_results
+                            ▼  (sequential: node 2 waits for node 1)
+╔═══════════════════════════════════════════════════════════╗
+║  Node 2 — retrieval          [single path, ~0–10 ms]     ║
+║                                                           ║
+║   TTLCache hit?  →  <5 ms   (skip everything)            ║
+║   Prefetch hit?  →  ~0 ms   (use prefetch result)        ║
+║   Cache miss     →  ~10 ms  (fresh Polars query)         ║
+║   + fuzzy name resolution (property/tenant/ledger)       ║
+╚═══════════════════════════╤═══════════════════════════════╝
+                            │ raw_results
+                            ▼  (sequential: node 3 waits for node 2)
+╔═══════════════════════════════════════════════════════════╗
+║  Node 3 — reason_and_synthesize  [PARALLEL inside node]  ║
+║                                                           ║
+║   ┌─────────────────────┐   ┌───────────────────────────┐ ║
+║   │  Critic + Judge     │   │  Synthesizer LLM          │ ║
+║   │  Python, <1 ms      │   │  generates NL response    │ ║
+║   │  validates filters  │   │  while critic runs        │ ║
+║   └──────────┬──────────┘   └─────────────┬─────────────┘ ║
+║         asyncio.create_task ───────────────┘              ║
+║   If judge=CLARIFY → cancel synthesis, return hint        ║
+║   If judge=OK      → return synthesizer response          ║
+╚═══════════════════════════╤═══════════════════════════════╝
+                            │
+                            ▼
+                  final_response → Streamlit UI
 ```
+
+> **Sequential between nodes, parallel within nodes 1 and 3.** LangGraph executes nodes in directed order (1 → 2 → 3). The parallelism (`asyncio.gather` / `asyncio.create_task`) happens inside Node 1 (LLM + Polars prefetch run simultaneously) and Node 3 (critic + synthesizer run simultaneously).
 
 **Graph edges:**
 
