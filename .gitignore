@@ -1,0 +1,44 @@
+# Secrets — NEVER commit
+.env
+.env.local
+.env.production
+*.key
+*.pem
+
+# MLflow artifacts
+mlruns/
+mlflow.db
+
+# Python
+__pycache__/
+*.py[oc]
+*.egg-info/
+dist/
+build/
+wheels/
+
+# Virtual environments
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Generated
+data_inspect.json
+setup_env.bat
+inspect_data.py
+
+# Models (large files)
+models/*.pkl
+
+# Generated / optimized data files
+cortex_optimized.parquet
+
+# Task description PDF (proprietary)
+AI_Developer_Agent_Real_Estate _Task.pdf

@@ -1,0 +1,217 @@
+"""Layer 2 — Smart Retrieval: 3-tier cache with async Polars queries.
+
+Tier 1: Response cache hit  →  0 ms (skips all computation)
+Tier 2: Prefetch hit        →  0 ms (data computed during extraction)
+Tier 3: Fresh Polars query  →  5–50 ms (run off event loop via asyncio.to_thread)
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from typing import Any
+
+import polars as pl
+
+from src.cache import cache_get, cache_set, make_cache_key
+from src.data.loader import get_dataframe
+
+logger = logging.getLogger(__name__)
+
+
+_PREFETCH_KEY_MAP: dict[str, list[str]] = {
+    "pl_summary:2024": ["pl_by_property_2024"],
+    "pl_summary:2025": ["pl_by_property_2025"],
+    "pl_summary:": ["pl_all"],
+    "tenant_query:": ["by_tenant"],
+    "comparison:2024": ["comparison_2024"],
+    "comparison:2025": ["comparison_2025"],
+    "comparison:": ["comparison_2024"],
+}
+
+
+def _prefetch_lookup_key(intent: str, filters: dict) -> str:
+    """Build a key to look up prefetch results."""
+    year = str(filters.get("year") or "")
+    return f"{intent}:{year}"
+
+
+async def retrieval(state: dict) -> dict:
+    """3-tier async retrieval: cache → prefetch → fresh Polars."""
+    t0 = time.perf_counter()
+    intent: str = (state.get("intent") if isinstance(state, dict) else state.intent) or "general"
+    filters: dict[str, Any] = (state.get("filters") if isinstance(state, dict) else state.filters) or {}
+    prefetch: dict = (state.get("prefetch_results") if isinstance(state, dict) else state.prefetch_results) or {}
+    timings: dict = (state.get("timings") if isinstance(state, dict) else state.timings) or {}
+
+    cache_key = make_cache_key(intent, filters)
+
+    # Tier 1: Response cache hit — skip everything
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return {
+            "raw_results": cached,
+            "retrieval_error": None,
+            "cache_hit": True,
+            "timings": {**timings, "retrieval": 0.0},
+        }
+
+    # Tier 2: Prefetch hit — data already computed during extraction
+    pkey = _prefetch_lookup_key(intent, filters)
+    prefetch_keys = _PREFETCH_KEY_MAP.get(pkey) or _PREFETCH_KEY_MAP.get(f"{intent}:")
+    if prefetch_keys:
+        for pk in prefetch_keys:
+            if pk in prefetch and prefetch[pk]:
+                results = prefetch[pk]
+                cache_set(cache_key, results)
+                elapsed = time.perf_counter() - t0
+                logger.debug("Retrieval: prefetch hit '%s' in %.1fms", pk, elapsed * 1000)
+                return {
+                    "raw_results": results,
+                    "retrieval_error": None,
+                    "cache_hit": False,
+                    "timings": {**timings, "retrieval": elapsed},
+                }
+
+    # Tier 3: Fresh Polars query — run off event loop
+    try:
+        results = await asyncio.to_thread(_run_polars_query, intent, filters)
+        cache_set(cache_key, results)
+        elapsed = time.perf_counter() - t0
+        return {
+            "raw_results": results,
+            "retrieval_error": None,
+            "cache_hit": False,
+            "timings": {**timings, "retrieval": elapsed},
+        }
+    except Exception as exc:
+        logger.exception("Retrieval error: %s", exc)
+        return {
+            "raw_results": [],
+            "retrieval_error": str(exc),
+            "cache_hit": False,
+            "timings": {**timings, "retrieval": time.perf_counter() - t0},
+        }
+
+
+def _run_polars_query(intent: str, filters: dict[str, Any]) -> list[dict]:
+    """Synchronous Polars query — called via asyncio.to_thread."""
+    df = get_dataframe()
+    filtered = _apply_filters(df, filters)
+    result = _route_intent(filtered, intent, filters)
+    return result.to_dicts() if isinstance(result, pl.DataFrame) else []
+
+
+def retrieval_sync(state: dict) -> dict:
+    """Synchronous fallback for direct testing without an event loop."""
+    intent: str = state.get("intent") or "general"
+    filters: dict[str, Any] = state.get("filters") or {}
+
+    cache_key = make_cache_key(intent, filters)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return {"raw_results": cached, "retrieval_error": None, "cache_hit": True}
+
+    try:
+        results = _run_polars_query(intent, filters)
+        cache_set(cache_key, results)
+        return {"raw_results": results, "retrieval_error": None, "cache_hit": False}
+    except Exception as exc:
+        return {"raw_results": [], "retrieval_error": str(exc), "cache_hit": False}
+
+
+def _normalize_ledger_value(val: str, known: set[str]) -> str:
+    """Normalize a ledger filter value to snake_case, with fuzzy fallback."""
+    normalized = val.lower().replace(" ", "_").replace("-", "_")
+    if normalized in known:
+        return normalized
+    from difflib import get_close_matches
+    matches = get_close_matches(normalized, list(known), n=1, cutoff=0.6)
+    return matches[0] if matches else normalized
+
+
+def _apply_filters(df: pl.DataFrame, filters: dict[str, Any]) -> pl.DataFrame:
+    """Apply all extracted filters to the DataFrame."""
+    from src.data.loader import get_cache
+    filter_col_map = {
+        "property_name": "property_name",
+        "tenant_name": "tenant_name",
+        "year": "year",
+        "quarter": "quarter",
+        "month": "month",
+        "ledger_group": "ledger_group",
+        "ledger_category": "ledger_category",
+        "ledger_type": "ledger_type",
+    }
+    ledger_normalize = {
+        "ledger_category": get_cache("available_ledger_categories") or set(),
+        "ledger_group": get_cache("available_ledger_groups") or set(),
+    }
+    mask = pl.lit(True)
+    for key, col in filter_col_map.items():
+        val = filters.get(key)
+        if val and col in df.columns:
+            if isinstance(val, list):
+                if key in ledger_normalize:
+                    known = ledger_normalize[key]
+                    val = [_normalize_ledger_value(str(v), known) for v in val]
+                mask = mask & pl.col(col).is_in([str(v) for v in val])
+            else:
+                if key in ledger_normalize:
+                    val = _normalize_ledger_value(str(val), ledger_normalize[key])
+                mask = mask & (pl.col(col) == str(val))
+    return df.filter(mask)
+
+
+def _route_intent(df: pl.DataFrame, intent: str, filters: dict) -> pl.DataFrame:
+    """Route to the appropriate aggregation based on intent."""
+    if intent == "pl_summary":
+        if filters.get("property_name"):
+            return (
+                df.group_by("ledger_group")
+                .agg(pl.col("profit").sum().alias("total_profit"))
+                .sort("total_profit", descending=True)
+            )
+        return (
+            df.filter(pl.col("property_name").is_not_null())
+            .group_by("property_name")
+            .agg(pl.col("profit").sum().alias("total_profit"))
+            .sort("total_profit", descending=True)
+        )
+
+    elif intent == "property_detail":
+        return (
+            df.filter(pl.col("property_name").is_not_null())
+            .group_by(["property_name", "ledger_group"])
+            .agg(pl.col("profit").sum().alias("total_profit"))
+            .sort("total_profit", descending=True)
+        )
+
+    elif intent == "tenant_query":
+        return (
+            df.filter(pl.col("tenant_name").is_not_null())
+            .group_by(["tenant_name", "property_name"])
+            .agg(pl.col("profit").sum().alias("total_profit"))
+            .sort("total_profit", descending=True)
+        )
+
+    elif intent == "comparison":
+        return (
+            df.filter(pl.col("property_name").is_not_null())
+            .group_by(["property_name", "ledger_type"])
+            .agg(pl.col("profit").sum().alias("total_profit"))
+            .sort("property_name")
+        )
+
+    elif intent == "ledger_query":
+        return df.select(
+            ["ledger_description", "ledger_category", "ledger_group", "month", "profit"]
+        ).sort("profit", descending=True)
+
+    else:
+        return (
+            df.group_by(["year", "ledger_type"])
+            .agg(pl.col("profit").sum().alias("total_profit"))
+            .sort("year")
+        )
