@@ -185,7 +185,8 @@ Default `difflib` cutoff of 0.6 matched `"Building 999"` → `"Building 17"`. Ra
 `class Config` inside `BaseModel` is deprecated in Pydantic v2. Replaced with `model_config = ConfigDict(arbitrary_types_allowed=True)`.
 
 ---
-![streamlit-app-record](https://drive.google.com/file/d/1NRdqN98TGPj9ojjnLCT1-2SOvXXADMjS/view?usp=sharing)
+[![streamlit-app-record](https://drive.google.com/file/d/1NRdqN98TGPj9ojjnLCT1-2SOvXXADMjS/view?usp=sharing)](https://docs.google.com/videos/d/1oPYEX6c3eMz98CIdHwWq-vCJNFrIhPZQzovMpYttwXQ/edit?usp=sharing)
+
 ## Data
 
 `cortex.parquet` — 3,924 rows · 5 properties (Building 17/120/140/160/180) · 2024-Q1 to 2025-Q1 · columns: `entity_name`, `property_name`, `tenant_name`, `ledger_type`, `ledger_group`, `ledger_category`, `ledger_code`, `ledger_description`, `month`, `quarter`, `year`, `profit`.
