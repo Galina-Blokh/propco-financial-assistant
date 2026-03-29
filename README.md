@@ -191,3 +191,9 @@ Default `difflib` cutoff of 0.6 matched `"Building 999"` → `"Building 17"`. Ra
 `cortex.parquet` — 3,924 rows · 5 properties (Building 17/120/140/160/180) · 2024-Q1 to 2025-Q1 · columns: `entity_name`, `property_name`, `tenant_name`, `ledger_type`, `ledger_group`, `ledger_category`, `ledger_code`, `ledger_description`, `month`, `quarter`, `year`, `profit`.
 
 See `data.md` for full schema and statistics, `SPEC.md` for the complete system specification.
+
+
+
+[Strimlit UI](https://github.com/user-attachments/assets/a994adb0-5d94-4719-a1b5-0549e411b6ea)
+
+
