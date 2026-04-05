@@ -8,6 +8,8 @@
 - **Domain**: Real estate financial ledger data for a property company ("PropCo")
 - **Time range**: 2024–2025 (15 months, 5 quarters)
 
+For architecture, agents, and UI behavior, see `SPEC.md` in the repo root.
+
 ## Columns
 
 | Column | Type | Nulls | Unique | Description |

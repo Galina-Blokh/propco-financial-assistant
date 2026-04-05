@@ -1,4 +1,9 @@
-"""PropCo Financial Assistant — Streamlit UI (3-layer optimized architecture)."""
+"""PropCo Financial Assistant — Streamlit UI with two-phase rendering.
+
+Phase 1: Data table rendered from raw_results after graph completes.
+Phase 2: Prose streamed token-by-token from the synthesizer's queue.
+Telemetry badge shown under each Q&A pair.
+"""
 
 from __future__ import annotations
 
@@ -12,54 +17,46 @@ st.set_page_config(
     layout="wide",
 )
 
-st.markdown("""
-<style>
-/* Circular send button */
-div[data-testid="stFormSubmitButton"] > button {
-    border-radius: 50% !important;
-    width: 2.6rem !important;
-    height: 2.6rem !important;
-    min-width: unset !important;
-    padding: 0 !important;
-    font-size: 1.1rem !important;
-    line-height: 1 !important;
-    display: flex !important;
-    align-items: center !important;
-    justify-content: center !important;
-}
-</style>
-""", unsafe_allow_html=True)
-
 # ---------------------------------------------------------------------------
-# Imports (after page config)
+# Light imports only — LangGraph + all agents are imported lazily on first query
+# (eager import can block 30–120s on WSL / slow disks and leaves a white page).
 # ---------------------------------------------------------------------------
 
 import polars as pl
-import plotly.express as px
 
-from src.cache import cache_size
 from src.data.loader import get_cache, warm_up
-from src.graph.workflow import build_graph, create_initial_state
 from src.utils.config import settings
 
 
+# ---------------------------------------------------------------------------
+# One-time initialisation
+# ---------------------------------------------------------------------------
+
 @st.cache_resource
 def _get_graph():
-    """Compile the LangGraph pipeline exactly once for the lifetime of the server."""
+    """Compile the LangGraph pipeline exactly once (heavy import happens here)."""
+    from src.telemetry import _ensure_init
+    _ensure_init()  # Enable mlflow.langchain.autolog() before first graph invocation
+    from src.graph.workflow import build_graph
     return build_graph()
 
-# Warm up data caches on first load (fast — in-memory Parquet read)
-warm_up()
 
-# Pre-warm LLM in background — never blocks UI startup
+try:
+    warm_up()
+except Exception as exc:
+    st.error(
+        f"**Could not load financial data.** Check `CORTEX_DATA_PATH` in `.env` "
+        f"and that `cortex.parquet` exists.\n\n`{type(exc).__name__}: {exc}`"
+    )
+    st.stop()
+
 if "llm_warmed" not in st.session_state:
     st.session_state.llm_warmed = True
     import threading as _threading
-    import asyncio as _asyncio
     from src.llm.local import prewarm_llm as _prewarm_llm
+
     _threading.Thread(
-        target=lambda: _asyncio.run(_prewarm_llm()),
-        daemon=True,
+        target=lambda: asyncio.run(_prewarm_llm()), daemon=True
     ).start()
 
 
@@ -67,52 +64,130 @@ if "llm_warmed" not in st.session_state:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _render_chart(df_pd, intent: str) -> None:
+def _render_chart(container, df_pd, intent: str | None, key_suffix: str = "") -> None:
     """Render an auto-selected Plotly bar chart based on intent."""
     try:
+        import plotly.express as px
+
         if "total_profit" not in df_pd.columns:
             return
         if intent in ("pl_summary", "property_detail") and "property_name" in df_pd.columns:
             fig = px.bar(
                 df_pd.sort_values("total_profit", ascending=True),
-                x="total_profit", y="property_name", orientation="h",
-                title="P&L by Property", labels={"total_profit": "Profit (€)", "property_name": "Property"},
-                color="total_profit", color_continuous_scale="RdYlGn",
+                x="total_profit",
+                y="property_name",
+                orientation="h",
+                title="P&L by Property",
+                labels={"total_profit": "Profit (€)", "property_name": "Property"},
+                color="total_profit",
+                color_continuous_scale="RdYlGn",
             )
-            st.plotly_chart(fig, width='stretch')
-        elif intent == "comparison" and "property_name" in df_pd.columns and "ledger_type" in df_pd.columns:
+            container.plotly_chart(fig, key=f"chart_pl{key_suffix}", width="stretch")
+        elif (
+            intent == "comparison"
+            and "property_name" in df_pd.columns
+            and "ledger_type" in df_pd.columns
+        ):
             fig = px.bar(
-                df_pd, x="property_name", y="total_profit", color="ledger_type",
-                barmode="group", title="Revenue vs Expenses by Property",
+                df_pd,
+                x="property_name",
+                y="total_profit",
+                color="ledger_type",
+                barmode="group",
+                title="Revenue vs Expenses by Property",
                 labels={"total_profit": "Profit (€)", "property_name": "Property"},
             )
-            st.plotly_chart(fig, width='stretch')
+            container.plotly_chart(fig, key=f"chart_cmp{key_suffix}", width="stretch")
         elif intent == "tenant_query" and "tenant_name" in df_pd.columns:
             top = df_pd.nlargest(10, "total_profit")
             fig = px.bar(
                 top.sort_values("total_profit", ascending=True),
-                x="total_profit", y="tenant_name", orientation="h",
-                title="Top 10 Tenants by Profit", labels={"total_profit": "Profit (€)", "tenant_name": "Tenant"},
+                x="total_profit",
+                y="tenant_name",
+                orientation="h",
+                title="Top 10 Tenants by Profit",
+                labels={"total_profit": "Profit (€)", "tenant_name": "Tenant"},
             )
-            st.plotly_chart(fig, width='stretch')
+            container.plotly_chart(fig, key=f"chart_tenant{key_suffix}", width="stretch")
     except Exception:
         pass
+
+
+def _emit_mlflow_log(result: dict, user_query: str) -> None:
+    """Call ``enqueue_query_log`` if present, else ``log_query`` (older trees)."""
+    try:
+        import src.telemetry as _tel
+    except ImportError:
+        return
+    fn = getattr(_tel, "enqueue_query_log", None) or getattr(_tel, "log_query", None)
+    if callable(fn):
+        fn(result, user_query)
+
+
+def _render_telemetry_badge(timings: dict, cache_tier: str | None, intent: str | None, workers: list | None = None) -> None:
+    """Render the per-query telemetry line."""
+    total_ms = sum(timings.values()) * 1000
+    tier = cache_tier or "—"
+    intent_str = intent or "?"
+    worker_keys = [k for k in timings if k.startswith("worker_")]
+    workers_str = " + ".join(k[7:] for k in worker_keys) if worker_keys else (" + ".join(workers) if workers else "")
+    non_worker_timings = {k: v for k, v in timings.items() if not k.startswith("worker_")}
+    detail = " · ".join(f"{k}: {v * 1000:.0f}ms" for k, v in non_worker_timings.items())
+    workers_part = f" | workers: `{workers_str}`" if workers_str else ""
+    st.caption(
+        f"⚡ **{total_ms:.0f} ms** | cache: {tier} | "
+        f"intent: `{intent_str}`{workers_part} | {detail}"
+    )
+
+
+def _render_history_section(msgs: list) -> None:
+    """Render completed Q&A pairs, newest first (reverse chronological by pair)."""
+    pair_count = len(msgs) // 2
+    for pair_idx in range(pair_count - 1, -1, -1):
+        idx = pair_idx * 2
+        q = msgs[idx]
+        a = msgs[idx + 1] if idx + 1 < len(msgs) else None
+
+        with st.chat_message("user"):
+            st.markdown(q["content"])
+
+        if a:
+            with st.chat_message("assistant"):
+                st.markdown(a["content"])
+
+                meta = a.get("meta") or {}
+                raw = meta.get("raw_results")
+                if raw:
+                    try:
+                        df_pd = pl.DataFrame(raw).to_pandas()
+                        with st.expander("📊 Retrieved Data", expanded=False):
+                            st.dataframe(df_pd, width="stretch")
+                        _render_chart(st, df_pd, meta.get("intent"), key_suffix=f"_h{idx}")
+                    except Exception:
+                        pass
+
+                _render_telemetry_badge(
+                    meta.get("timings") or {},
+                    meta.get("cache_tier"),
+                    meta.get("intent"),
+                    meta.get("workers"),
+                )
+
+    if len(msgs) % 2 == 1 and msgs:
+        with st.chat_message("user"):
+            st.markdown(msgs[-1]["content"])
+
+
 
 
 # ---------------------------------------------------------------------------
 # Session state
 # ---------------------------------------------------------------------------
 
-def _init_session() -> None:
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-    if "last_result" not in st.session_state:
-        st.session_state.last_result = None
-    if "pending_prompt" not in st.session_state:
-        st.session_state.pending_prompt = None
-
-
-_init_session()
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "pending_prompt" not in st.session_state:
+    st.session_state.pending_prompt = None
 
 
 # ---------------------------------------------------------------------------
@@ -124,28 +199,37 @@ with st.sidebar:
 
     profit_by_year = get_cache("total_profit_by_year") or {}
     for year in sorted(profit_by_year, reverse=True):
-        label = f"Total P&L {year}"
-        st.metric(label, f"€{profit_by_year[year]:,.0f}")
+        st.metric(f"Total P&L {year}", f"€{profit_by_year[year]:,.0f}")
 
     st.divider()
     props = sorted(get_cache("available_properties") or [])
     tenants = sorted(get_cache("available_tenants") or [])
     st.caption(f"🏗 Properties ({len(props)}): {', '.join(props)}")
     st.caption(f"👥 Tenants: {len(tenants)}")
-    st.caption(f"📅 2024-Q1 — 2025-Q1")
+    st.caption("📅 2024-Q1 — 2025-Q1")
 
     st.divider()
     st.subheader("⚙ Settings")
     backend = settings.llm_backend
-    model = settings.local_model_path if backend == "local" else settings.openai_model_reasoning
-    st.caption(f"LLM backend: `{backend}`")
-    st.caption(f"Model: `{model}`")
-    show_raw = st.toggle("Show retrieved data", value=True)
+    model = (
+        settings.local_model_path if backend == "local" else settings.openai_model_reasoning
+    )
+    st.caption(f"LLM: `{backend}` · Model: `{model}`")
 
     if st.button("🗑 Clear Chat"):
         st.session_state.messages = []
-        st.session_state.last_result = None
-        # No st.rerun() — button click already triggers one rerun; a second is wasteful
+
+    with st.expander("MLflow (tracking URI)", expanded=False):
+        from src.telemetry import get_tracking_uri
+
+        st.caption(
+            "Use **Experiments** → experiment below → **Runs** (not Registry, Traces, or Evaluations)."
+        )
+        st.code(get_tracking_uri(), language=None)
+        st.caption(
+            f"Experiment: `{settings.mlflow_experiment_name}` · "
+            f"enabled `{settings.mlflow_enabled}` · artifacts `{settings.mlflow_log_artifacts}`"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -154,165 +238,168 @@ with st.sidebar:
 
 st.title("🏢 PropCo Financial Assistant")
 
-left_col, right_col = st.columns([3, 2])
+# --- Input at the TOP ---
+pending = st.session_state.pending_prompt
+prompt = st.chat_input("Ask about PropCo's financials…")
+if not prompt and pending:
+    prompt = pending
+    st.session_state.pending_prompt = None
 
-# ---------------------------------------------------------------------------
-# Chat panel (left)
-# ---------------------------------------------------------------------------
-
-with left_col:
-    pending_prompt = st.session_state.pending_prompt
-
-    # --- Quick picks: above the input ---
-    st.markdown("**Quick picks:**")
-    examples = [
-        "Compare revenue for Building 17 vs 120 in 2024",
-        "What's the total P&L for Q2 2024?",
-        "Which tenant generates the most revenue?",
-        "Building 140 expenses breakdown",
-        "Bank charges in 2024",
-    ]
-    _qcols = st.columns(2)
-    for i, ex in enumerate(examples):
-        if _qcols[i % 2].button(ex, key=f"ex_{ex}"):
-            st.session_state.pending_prompt = ex
-            st.rerun()
-
-    st.divider()
-
-    # --- Input below quick picks ---
-    with st.form(key="chat_form", clear_on_submit=True):
-        _ic, _bc = st.columns([11, 1])
-        with _ic:
-            chat_input = st.text_input(
-                "Ask about PropCo's financials...",
-                placeholder="e.g. Bank charges in 2024, Compare Building 17 vs 120...",
-                label_visibility="collapsed",
-            )
-        with _bc:
-            submitted = st.form_submit_button("→")
-
-    # Typed input takes priority; pending_prompt (example click) fires immediately
-    prompt = chat_input.strip() if submitted and chat_input.strip() else None
-    if not prompt and pending_prompt:
-        prompt = pending_prompt
-        st.session_state.pending_prompt = None
-
-    st.divider()
-
-    # --- Execute query (renders inline; on rerun appears in reversed history) ---
-    if prompt:
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
-
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                initial_state = create_initial_state(user_query=prompt)
-                result = asyncio.run(
-                    _get_graph().ainvoke(initial_state)
-                )
-                st.session_state.last_result = result
-
-            _r = result if isinstance(result, dict) else result.model_dump()
-            output = _r.get("final_response") or "No response generated."
-            st.markdown(output)
-
-            timings = _r.get("timings") or {}
-            total_ms = sum(timings.values()) * 1000
-            cache_hit = _r.get("cache_hit", False)
-            intent = _r.get("intent") or "?"
-            badge = (
-                f"⚡ **{total_ms:.0f} ms** &nbsp;|&nbsp; "
-                f"{'🟢 cache hit' if cache_hit else '🔵 live query'} &nbsp;|&nbsp; "
-                f"intent: `{intent}`"
-            )
-            st.caption(badge)
-
-        st.session_state.messages.append({"role": "assistant", "content": output})
-        st.rerun()
-
-    # --- Chat history: newest pair at top, oldest at bottom ---
-    # Pair messages as [(user_q, asst_a), ...] then reverse so newest is first
-    _msgs = st.session_state.messages
-    _pairs = [(_msgs[i], _msgs[i + 1]) for i in range(0, len(_msgs) - 1, 2)]
-    for _q, _a in reversed(_pairs):
-        with st.chat_message(_q["role"]):
-            st.markdown(_q["content"])
-        with st.chat_message(_a["role"]):
-            st.markdown(_a["content"])
-    # Unpaired trailing user message (mid-flight, shouldn't normally appear)
-    if len(_msgs) % 2 == 1:
-        with st.chat_message(_msgs[-1]["role"]):
-            st.markdown(_msgs[-1]["content"])
+# --- Quick-pick example buttons ---
+st.markdown("**Try these:**")
+examples = [
+    "Compare revenue for Building 17 vs 120 in 2024",
+    "What's the total P&L for Q2 2024?",
+    "Which tenant generates the most revenue?",
+    "Building 140 expenses breakdown",
+    "Bank charges in 2024",
+]
 
 
-# ---------------------------------------------------------------------------
-# Data panel (right)
-# ---------------------------------------------------------------------------
-
-with right_col:
-    result = st.session_state.last_result
-    _r = (result if isinstance(result, dict) else result.model_dump()) if result else {}
-
-    if _r:
-        intent = _r.get("intent")
-        filters = _r.get("filters") or {}
-        critique = _r.get("critique", "OK")
-        needs_clarification = _r.get("needs_clarification", False)
-        cache_hit = _r.get("cache_hit", False)
-        timings = _r.get("timings") or {}
-
-        st.subheader("📋 Query Details")
-        if intent:
-            st.caption(f"**Intent:** `{intent}`")
-        if filters:
-            st.caption(f"**Filters:** `{filters}`")
-        if timings:
-            timing_str = "  ·  ".join(f"{k}: {v*1000:.0f}ms" for k, v in timings.items())
-            st.caption(f"⏱ {timing_str}")
-        if cache_hit:
-            st.success(f"🟢 Cache hit — {cache_size()} entries cached")
-        if critique and critique != "OK":
-            st.warning(f"⚠️ {critique}")
-        if needs_clarification:
-            st.info(_r.get("clarification_message", ""))
-
-    if _r.get("raw_results") and show_raw:
-        rows = _r["raw_results"]
-        intent = _r.get("intent")
-        st.subheader("� Retrieved Data")
-        try:
-            df_pl = pl.DataFrame(rows)
-            df_pd = df_pl.to_pandas()
-            st.dataframe(df_pd, width='stretch')
-
-            # Auto Plotly chart for visual intents
-            if intent in ("pl_summary", "comparison", "tenant_query", "property_detail"):
-                _render_chart(df_pd, intent)
-        except Exception:
-            st.json(rows[:20])
-
-    if _r.get("error"):
-        st.error(f"❌ {_r['error']}")
+def _queue_example(text: str) -> None:
+    st.session_state.pending_prompt = text
 
 
-# ---------------------------------------------------------------------------
-# Pipeline stages (bottom)
-# ---------------------------------------------------------------------------
+qcols = st.columns(len(examples))
+for i, ex in enumerate(examples):
+    qcols[i].button(ex, key=f"ex_{i}", on_click=_queue_example, args=(ex,))
 
 st.divider()
-_v2_stages = ["extractor", "retrieval", "reason_and_synth"]
-_v2_labels = ["Extractor ⚡", "Retrieval 🗄", "Reason+Synth 🧠"]
-_stage_cols = st.columns(len(_v2_stages))
-_last = st.session_state.last_result
-_lr = (_last if isinstance(_last, dict) else _last.model_dump()) if _last else {}
-for _col, _stage, _label in zip(_stage_cols, _v2_stages, _v2_labels):
-    _ms = _lr.get("timings", {}).get(_stage.replace("reason_and_synth", "reason_and_synthesize"), None)
-    if _lr.get("intent") is not None:
-        _badge = f" ({_ms*1000:.0f}ms)" if _ms is not None else ""
-        _col.markdown(f"✅ **{_label}**{_badge}")
-    else:
-        _col.markdown(f"⬜ {_label}")
 
+# ---------------------------------------------------------------------------
+# Active query — renders right below input (newest first)
+# ---------------------------------------------------------------------------
 
+if prompt:
+    from src.graph.workflow import create_initial_state
+
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    with st.chat_message("assistant"):
+        status_ph = st.empty()
+        prose_ph = st.empty()
+        data_container = st.container()
+
+        status_ph.caption("⏳ Processing…")
+
+        async def _run():
+            graph = _get_graph()
+            token_queue: asyncio.Queue = asyncio.Queue()
+            history = [
+                {"role": m["role"], "content": m["content"]}
+                for m in st.session_state.messages[-6:]
+            ]
+            initial = create_initial_state(
+                user_query=prompt, conversation_history=history
+            )
+            initial["token_queue"] = token_queue
+
+            graph_task = asyncio.create_task(graph.ainvoke(initial))
+
+            streamed = ""
+            while True:
+                try:
+                    token = await asyncio.wait_for(token_queue.get(), timeout=0.05)
+                except asyncio.TimeoutError:
+                    if graph_task.done():
+                        break
+                    continue
+                if token is None:
+                    break
+                streamed += token
+                prose_ph.markdown(streamed + "▌")
+
+            result = await graph_task
+            return result, streamed
+
+        async def _run_with_timeout():
+            return await asyncio.wait_for(_run(), timeout=180.0)
+
+        try:
+            # Run async graph in a dedicated thread with its own event loop to
+            # avoid RuntimeError when Streamlit already has a running event loop.
+            import concurrent.futures as _cf
+            import threading as _thr
+
+            _result_box: list = [None]
+            _exc_box: list = [None]
+
+            def _run_in_thread():
+                _loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(_loop)
+                try:
+                    _result_box[0] = _loop.run_until_complete(_run_with_timeout())
+                except Exception as _e:
+                    _exc_box[0] = _e
+                finally:
+                    _loop.close()
+                    asyncio.set_event_loop(None)
+
+            _t = _thr.Thread(target=_run_in_thread, daemon=True)
+            _t.start()
+            _t.join(timeout=185)
+
+            if _exc_box[0] is not None:
+                raise _exc_box[0]
+            if _result_box[0] is None:
+                raise asyncio.TimeoutError
+
+            result, streamed = _result_box[0]
+            _r = result if isinstance(result, dict) else {}
+            output = _r.get("final_response") or streamed or "No response generated."
+        except asyncio.TimeoutError:
+            _r = {}
+            output = "Request timed out after 3 minutes — try a simpler question or check your network."
+        except Exception as exc:
+            _r = {}
+            output = f"Something went wrong — please try again. ({type(exc).__name__})"
+
+        prose_ph.markdown(output)
+        status_ph.empty()
+
+        if _r.get("raw_results"):
+            try:
+                df = pl.DataFrame(_r["raw_results"])
+                df_pd = df.to_pandas()
+                with data_container.expander("📊 Retrieved Data", expanded=False):
+                    st.dataframe(df_pd, width="stretch")
+                _render_chart(data_container, df_pd, _r.get("intent"), key_suffix="_live")
+            except Exception:
+                pass
+
+        _render_telemetry_badge(
+            _r.get("timings") or {},
+            _r.get("cache_tier"),
+            _r.get("intent"),
+        )
+
+    # Prior turns (current reply is above). Must run before st.rerun() — the block
+    # below is skipped when rerun aborts the script, which hid all older Q&A.
+    _render_history_section(st.session_state.messages)
+
+    st.session_state.messages.append({"role": "user", "content": prompt, "meta": {}})
+    # Limit stored raw_results to 20 rows — prevents session state bloat after
+    # many queries and is the primary cause of UI slowdown/stacking.
+    _raw_trimmed = (_r.get("raw_results") or [])[:20]
+    _worker_types = list(dict.fromkeys(
+        wr.get("worker_type", "") for wr in (_r.get("worker_results") or [])
+        if wr.get("worker_type")
+    ))
+    st.session_state.messages.append({
+        "role": "assistant",
+        "content": output,
+        "meta": {
+            "timings": _r.get("timings") or {},
+            "cache_tier": _r.get("cache_tier"),
+            "intent": _r.get("intent"),
+            "raw_results": _raw_trimmed,
+            "workers": _worker_types,
+        },
+    })
+    _emit_mlflow_log(_r, prompt)
+    st.rerun()
+
+else:
+    # Idle: show full transcript (newest pair first).
+    _render_history_section(st.session_state.messages)

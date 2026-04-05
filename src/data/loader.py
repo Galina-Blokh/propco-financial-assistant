@@ -32,7 +32,9 @@ def get_cache(key: str) -> Any:
 
 
 def warm_up() -> None:
-    """Pre-load data and build all caches at startup."""
+    """Pre-load data and build all caches at startup (once per process)."""
+    if _CACHES:
+        return
     _build_caches()
 
 

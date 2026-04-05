@@ -1,12 +1,11 @@
-"""Layer 1a — Extractor: LLM-based intent + filter extraction.
+"""Layer 1 — Planner: LLM-based intent extraction + parallel worker decomposition.
 
-Runs in parallel with Prefetcher via LangGraph fan-out edges.
-Parses the user's natural-language query into a structured intent + filters
-dict using the configured LLM backend (OpenAI or local GGUF).
+Replaces the extractor + prefetcher fan-out from v2. A single LLM call extracts
+intent and filters (same prompt as extractor), then deterministic logic decomposes
+the query into one or more WorkerAssignment dicts dispatched via Send().
 
-Includes ambiguity detection: if the query is too vague the extractor sets
-``needs_clarification`` and a ``clarification_message`` so the gate can
-short-circuit to the clarify node without wasting retrieval time.
+Comparison queries with ≥2 properties → one worker per property (true parallelism).
+All other queries → single worker with the full filter set.
 """
 
 from __future__ import annotations
@@ -53,8 +52,7 @@ If prior conversation is provided, resolve any references (e.g. "last year", \
 
 If the query is ambiguous or too vague to determine the intent/filters reliably, \
 set "confidence" to a low value (<0.5) and provide a "clarification_question" that \
-would help narrow down the query. Examples of ambiguous: "show data", "revenue", \
-"compare" without specifying what to compare.
+would help narrow down the query.
 
 Return format:
 {{"intent": "<intent>", "filters": {{<key>: <value>, ...}}, \
@@ -73,7 +71,6 @@ JSON:"""
 
 @functools.lru_cache(maxsize=1)
 def _build_system_prompt() -> str:
-    """Build and cache the system prompt (entity lists are static after startup)."""
     return SYSTEM_PROMPT.format(
         available_properties=sorted(get_cache("available_properties") or []),
         available_tenants=sorted(get_cache("available_tenants") or []),
@@ -84,14 +81,13 @@ def _build_system_prompt() -> str:
     )
 
 
-async def extractor(state: dict) -> dict:
-    """Parse the user query into structured intent + filters via LLM."""
+async def planner(state: dict) -> dict:
+    """Extract intent+filters via LLM, then decompose into parallel worker assignments."""
     t0 = time.perf_counter()
-    user_query = state["user_query"]
+    user_query: str = state["user_query"]
     conversation_history: list[dict] = state.get("conversation_history") or []
 
     system = _build_system_prompt()
-
     if conversation_history:
         history_text = "\n".join(
             f'{m["role"]}: {m["content"]}' for m in conversation_history[-6:]
@@ -111,7 +107,6 @@ async def extractor(state: dict) -> dict:
         model=settings.openai_model_extraction,
     )
     parsed = _parse_json(raw)
-
     if parsed is None:
         raw2 = await chat_complete(
             system=system,
@@ -122,25 +117,27 @@ async def extractor(state: dict) -> dict:
             model=settings.openai_model_extraction,
         )
         parsed = _parse_json(raw2)
-
     if parsed is None:
-        logger.warning("Extractor: JSON parse failed twice, falling back to general")
+        logger.warning("Planner: JSON parse failed twice, falling back to general")
         parsed = {"intent": "general", "filters": {}}
 
-    intent = parsed.get("intent", "general")
-    filters = parsed.get("filters", {})
-    if not isinstance(filters, dict):
-        filters = {}
+    intent: str = parsed.get("intent", "general")
+    raw_filters = parsed.get("filters", {})
+    if not isinstance(raw_filters, dict):
+        raw_filters = {}
+    filters = resolve_filters(raw_filters)
 
     confidence = float(parsed.get("confidence", 0.8))
     needs_clarification = parsed.get("needs_clarification", False) or confidence < 0.4
     clarification_question = parsed.get("clarification_question")
 
+    worker_assignments = _plan_workers(intent, filters, user_query)
+
     result: dict = {
         "intent": intent,
-        "filters": resolve_filters(filters),
-        "extraction_error": None,
-        "timings": {"extractor": time.perf_counter() - t0},
+        "filters": filters,
+        "worker_assignments": worker_assignments,
+        "timings": {"planner": time.perf_counter() - t0},
     }
 
     if needs_clarification and clarification_question:
@@ -150,8 +147,34 @@ async def extractor(state: dict) -> dict:
     return result
 
 
+def _plan_workers(intent: str, filters: dict, user_query: str) -> list[dict]:
+    """Decompose into parallel worker assignments.
+
+    Comparison with ≥2 properties → one assignment per property.
+    All other cases → single assignment.
+    """
+    property_names = filters.get("property_names") or []
+    if intent == "comparison" and len(property_names) >= 2:
+        shared = {k: v for k, v in filters.items() if k != "property_names"}
+        return [
+            {
+                "worker_type": "comparison_worker",
+                "filters": {**shared, "property_name": prop},
+                "question": f"P&L breakdown for property {prop}",
+            }
+            for prop in property_names
+        ]
+
+    return [
+        {
+            "worker_type": intent or "pl_summary",
+            "filters": filters,
+            "question": user_query,
+        }
+    ]
+
+
 def _parse_json(raw: str) -> dict | None:
-    """Attempt to parse raw LLM output as JSON."""
     try:
         text = raw.strip()
         start = text.find("{")

@@ -1,10 +1,18 @@
 from pathlib import Path
 
 from dotenv import load_dotenv
-from pydantic import ConfigDict
+from pydantic import ConfigDict, Field
 from pydantic_settings import BaseSettings
 
-load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+load_dotenv(_PROJECT_ROOT / ".env")
+
+
+def _default_mlflow_tracking_uri() -> str:
+    """Local file store under the repo (no SQLite lock fights with ``mlflow ui``)."""
+    p = (_PROJECT_ROOT / "mlflow-tracking").resolve()
+    p.mkdir(parents=True, exist_ok=True)
+    return p.as_uri()
 
 
 class Settings(BaseSettings):
@@ -38,8 +46,10 @@ class Settings(BaseSettings):
     # Paths
     cortex_data_path: str = str(Path(__file__).resolve().parents[2] / "cortex.parquet")
 
-    # MLflow
-    mlflow_tracking_uri: str = "sqlite:///mlruns.db"
+    # MLflow (disable with MLFLOW_ENABLED=false if it interferes with the UI)
+    mlflow_enabled: bool = True
+    mlflow_log_artifacts: bool = False
+    mlflow_tracking_uri: str = Field(default_factory=_default_mlflow_tracking_uri)
     mlflow_experiment_name: str = "real_estate_agent"
 
     # Application

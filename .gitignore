@@ -5,8 +5,10 @@
 *.key
 *.pem
 
-# MLflow artifacts
+# MLflow (sqlite and/or file store under repo)
 mlruns/
+mlflow-tracking/
+mlruns.db
 mlflow.db
 
 # Python
@@ -28,6 +30,8 @@ wheels/
 # OS
 .DS_Store
 Thumbs.db
+# Bash `2>nul` typo on Linux/WSL creates this file
+nul
 
 # Generated
 data_inspect.json
